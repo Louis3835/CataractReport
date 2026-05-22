@@ -7,7 +7,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ⚠️ 填入你的 NVIDIA API Key
-NVIDIA_API_KEY = "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"
+NVIDIA_API_KEY = ""
 
 # 创建一个文件锁，确保多线程写入时数据不会错乱
 file_lock = threading.Lock()
