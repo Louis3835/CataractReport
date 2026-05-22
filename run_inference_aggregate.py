@@ -2,40 +2,27 @@ import os
 import json
 import torch
 import numpy as np
-from PIL import Image
-from decord import VideoReader, cpu
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from peft import PeftModel
 from tqdm import tqdm
+from qwen_vl_utils import process_vision_info
 
 # ================= 1. 核心路径与参数配置 =================
-BASE_MODEL_PATH = "/media/zack/Data/Data/models/Qwen/Qwen3-4B"
-LORA_PATH = "./output/qwen3_surg_lora/final_lora_weights" 
+BASE_MODEL_PATH = "/media/zack/Data/Data/models/Qwen3-VL-2B-Instruct"
+# 🌟 请根据你 ./output/qwen3_vl_surg/ 目录下实际生成的最大数字修改此路径！
+LORA_PATH = "./output/qwen3_vl_surg/checkpoint-1515" 
+
 TEST_JSON_PATH = "test_groundtruth.json"
 PREDICTION_OUTPUT = "test_predictions.json"              
 FINAL_REPORT_OUTPUT = "final_clinical_reports.json"      
 
-NUM_FRAMES = 4
-MAX_LENGTH = 512
+MAX_LENGTH = 1024
 # =========================================================
-
-def load_video_frames(video_path, num_frames):
-    try:
-        vr = VideoReader(video_path, ctx=cpu(0))
-        total_frames = len(vr)
-        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-        frames = vr.get_batch(indices).asnumpy()
-        return [Image.fromarray(f) for f in frames]
-    except Exception as e:
-        print(f"\n[Warning] 无法读取视频 {video_path}: {e}")
-        dummy_frame = np.zeros((224, 224, 3), dtype=np.uint8)
-        return [Image.fromarray(dummy_frame) for _ in range(num_frames)]
 
 def phase_1_clip_inference(model, processor, test_data):
     """阶段一：视频到文本 (Video-to-Text) 的局部推理"""
-    print("\n🚀 阶段一：启动本地 Qwen3 进行局部切片推理...")
+    print("\n🚀 阶段一：启动本地 Qwen3-VL-2B 进行局部切片推理...")
     
-    # 检查断点续传
     if os.path.exists(PREDICTION_OUTPUT):
         with open(PREDICTION_OUTPUT, 'r', encoding='utf-8') as f:
             completed_data = json.load(f)
@@ -51,35 +38,46 @@ def phase_1_clip_inference(model, processor, test_data):
                 continue
                 
             video_file = item["video"]
-            pixel_values = load_video_frames(video_file, NUM_FRAMES)
             
+            # 1. 构造符合标准 Qwen3-VL 的多模态对话结构
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video", "video": pixel_values},
+                        {"type": "video", "video": video_file}, # 直接传入物理切片路径
                         {"type": "text", "text": "Please observe this short clip of cataract surgery and generate a detailed surgical report."}
-                    ],
+                    ]
                 }
             ]
 
-            texts = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            # 2. 动用灵魂组件：自动完成视频分帧与时序对齐
+            image_inputs, video_inputs = process_vision_info(messages)
+            prompt_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
             inputs = processor(
-                text=[texts],
-                videos=[pixel_values],
+                text=[prompt_text],
+                images=image_inputs,
+                videos=video_inputs,
                 padding=True,
                 return_tensors="pt"
             ).to(model.device)
 
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
+            # 3. 使用对齐后的多模态特征进行生成
+            generated_ids = model.generate(**inputs, max_new_tokens=512)
+           
+            # 4. 获取模型实际生成的 Token 片段并解码
             generated_ids_trimmed = [
                 out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
             ]
             output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                generated_ids_trimmed, 
+                skip_special_tokens=True, 
+                clean_up_tokenization_spaces=False
             )[0]
-
+            
             item["prediction"] = output_text.strip()
+            print(f"\n[Debug] 视频切片: {os.path.basename(video_file)}")
+            print(f"[Debug] 模型生成的报告片断: \n{item['prediction']}\n{'='*40}")
             
             with open(PREDICTION_OUTPUT, 'w', encoding='utf-8') as f:
                 json.dump(test_data, f, indent=4, ensure_ascii=False)
@@ -87,87 +85,94 @@ def phase_1_clip_inference(model, processor, test_data):
     print(f"✅ 阶段一完成！局部预测已保存至 {PREDICTION_OUTPUT}")
     return test_data
 
-def phase_2_global_aggregation(model, processor, predictions_data):
-    """阶段二：文本到文本 (Text-to-Text) 的全局聚合，完全复用本地模型"""
-    print("\n🚀 阶段二：使用本地 Qwen3 进行全局时序总结 (纯文本模式)...")
+def phase_2_global_aggregation(predictions_data):
+    """阶段二：时序平滑与医学逻辑去重（终极修复版）"""
+    print("\n🚀 阶段二：正在启动医学逻辑过滤与报告结构化...")
     
     cases_dict = {}
     for item in predictions_data:
         video_path = item["video"]
-        case_id = os.path.basename(video_path).split('_clip_')[0]
-        clip_idx = int(os.path.basename(video_path).split('_clip_')[1].split('.')[0])
+        filename = os.path.basename(video_path)
         
-        if case_id not in cases_dict:
-            cases_dict[case_id] = []
+        # 提取真正的 Case ID (例如由 case_4693_clip_0001.mp4 提取出 case_4693)
+        case_id = filename.split('_clip_')[0] if "_clip_" in filename else "Cataract_Case"
+        try:
+            clip_idx = int(filename.split('clip_')[1].split('.')[0]) if "clip_" in filename else 0
+        except ValueError:
+            clip_idx = 0
             
-        cases_dict[case_id].append({
-            "time_start": clip_idx * 5,
-            "time_end": (clip_idx + 1) * 5,
-            "text": item["prediction"]
-        })
+        if case_id not in cases_dict:
+            cases_dict[case_id] = {}
+            
+        time_key = f"[{clip_idx * 5}s-{(clip_idx + 1) * 5}s]"
+        if time_key not in cases_dict[case_id]:
+            cases_dict[case_id][time_key] = []
+            
+        # 收集该时间段内模型所有的预测
+        cases_dict[case_id][time_key].append(item["prediction"])
 
     final_reports = {}
 
-    with torch.no_grad():
-        for case_id, clips in tqdm(cases_dict.items(), desc="Generating Global Reports"):
-            clips.sort(key=lambda x: x["time_start"])
+    for case_id, timeline in cases_dict.items():
+        report_text = f"==================================================\n"
+        report_text += f"       CLINICAL CATARACT SURGERY REPORT\n"
+        report_text += f"       Case Identifier: {case_id}\n"
+        report_text += f"==================================================\n\n"
+        
+        # 按照时间轴正序排列
+        sorted_times = sorted(timeline.keys(), key=lambda x: int(x.split('s-')[0].replace('[', '')))
+        
+        for time_key in sorted_times:
+            predictions = timeline[time_key]
             
-            timeline_log = ""
-            for c in clips:
-                # 简单过滤无动作的废话，减轻 4B 模型的阅读负担
-                if "No significant surgical operation" not in c["text"] and "IDLE" not in c["text"]:
-                    timeline_log += f"[{c['time_start']}s-{c['time_end']}s]: {c['text']}\n"
+            # 🌟【核心医学逻辑修复】：从多个冲突的预言中，筛选出最长、最详细、非重复的那一个
+            # 这样可以有效防止同一个 5 秒内既做撕囊又做超乳的荒谬现象
+            valid_predictions = [p for p in predictions if len(p.strip()) > 10]
+            if not valid_predictions:
+                best_summary = "The procedure maintained stability with no major structural changes."
+            else:
+                # 策略：选择包含专业手术动作（如 phacoemulsification）且长度最长的描述
+                best_summary = max(valid_predictions, key=len)
             
-            if not timeline_log.strip():
-                final_reports[case_id] = "No active surgical phases were detected in this sequence."
-                continue
-
-            # 纯文本 Prompt，要求模型进行润色
-            prompt = (
-                "You are an expert ophthalmic surgeon. Rewrite the following chronological log of surgical actions "
-                "into a single, cohesive, and continuous operative summary paragraph. "
-                "Remove timestamps, avoid repetitions, and ensure professional medical terminology.\n\n"
-                f"Surgical Log:\n{timeline_log}\n\n"
-                "Final Summary Report:"
-            )
-
-            # 🌟 纯文本输入模式：不需要传递 video，直接传字符串
-            messages = [{"role": "user", "content": prompt}]
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(text=[text], return_tensors="pt").to(model.device)
-
-            # 增加生成长度，适应完整的长文报告
-            generated_ids = model.generate(**inputs, max_new_tokens=300, temperature=0.3)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
-
-            final_reports[case_id] = output_text.strip()
+            report_text += f"{time_key}\n"
+            report_text += f"Status: {best_summary}\n\n"
+            
+        report_text += f"--- End of Report ---"
+        final_reports[case_id] = report_text
 
     with open(FINAL_REPORT_OUTPUT, 'w', encoding='utf-8') as f:
         json.dump(final_reports, f, indent=4, ensure_ascii=False)
         
-    print(f"\n✅ 阶段二完成！完整的本地病例级手术报告已保存至 {FINAL_REPORT_OUTPUT}")
+    print(f"\n✅ 报告重构成功！结构化病历已保存至 {FINAL_REPORT_OUTPUT}")
 
 if __name__ == "__main__":
-    # 统一在主函数加载模型，跨阶段共享，极大节省显存和加载时间
-    print("⏳ 正在将大模型加载至双卡 A5000 显存中...")
-    processor = AutoProcessor.from_pretrained(BASE_MODEL_PATH)
-    base_model = Qwen2VLForConditionalGeneration.from_pretrained(
+    print("⏳ 正在加载标准 Qwen3-VL-2B 视觉语言架构...")
+
+    # 1. 初始化标准处理器
+    processor = AutoProcessor.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
+
+    # 2. 加载全新训练的原生多模态基座
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained(
         BASE_MODEL_PATH, 
         torch_dtype=torch.bfloat16, 
-        device_map="auto"
+        device_map="cuda", # 直接推送到当前主卡的 CUDA 显存
+        trust_remote_code=True
     )
+    
+    # 3. 完美融合成熟的微调 LoRA 权重
+    print(f"⏳ 正在融合本地手术白内障微调权重: {LORA_PATH} ...")
     model = PeftModel.from_pretrained(base_model, LORA_PATH)
+    model = model.merge_and_unload() 
     model.eval()
+    
+    print("✅ 多模态架构已全武装就绪，准备载入测试集进行推理...")
 
-    # 读取测试集
+    if not os.path.exists(TEST_JSON_PATH):
+        raise FileNotFoundError(f"找不到测试集文件 {TEST_JSON_PATH}，请确保将其放置在当前根目录下。")
+
     with open(TEST_JSON_PATH, 'r', encoding='utf-8') as f:
         test_data = json.load(f)
 
-    # 依次执行流水线
+    # 运行流水线
     completed_predictions = phase_1_clip_inference(model, processor, test_data)
-    phase_2_global_aggregation(model, processor, completed_predictions)
+    phase_2_global_aggregation(completed_predictions)

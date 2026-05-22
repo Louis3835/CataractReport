@@ -2,87 +2,59 @@ import torch
 import json
 import os
 from torch.utils.data import Dataset
-from PIL import Image
-from decord import VideoReader, cpu
-import numpy as np
+from qwen_vl_utils import process_vision_info
 
 class SurgicalVideoDataset(Dataset):
-    def __init__(self, jsonl_path, processor, video_folder, num_frames=8, max_length=1024):
-        # ❌ 删除了这行：self.data = [json.loads(line) for line in open(jsonl_path...)]
+    def __init__(self, jsonl_path, processor, video_folder, max_length=1024):
         self.processor = processor
         self.video_folder = video_folder
-        self.num_frames = num_frames
         self.max_length = max_length
         self.examples = []
         
-        # 🌟 核心拦截逻辑：读取 jsonl 时进行物理验活
-        missing_count = 0
         with open(jsonl_path, 'r', encoding='utf-8') as f:
             for line in f:
                 data = json.loads(line)
-                video_path = os.path.join(self.video_folder, data["video"])
-                
-                # 只有当硬盘里真的有这个 MP4 文件时，才加入训练集 (唯一数据源)
-                if os.path.exists(video_path):
+                if os.path.exists(os.path.join(self.video_folder, data["video"])):
                     self.examples.append(data)
-                else:
-                    missing_count += 1
-                    
-        print(f" 数据集加载完毕！有效样本数: {len(self.examples)}")
-        if missing_count > 0:
-            print(f" 已自动清理 {missing_count} 个因边界错位缺失的尾部幽灵片段。")
-
-    def _load_video(self, video_path):
-        try:
-            vr = VideoReader(video_path, ctx=cpu(0))
-            total_frames = len(vr)
-            indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
-            frames = vr.get_batch(indices).asnumpy()
-            return [Image.fromarray(f) for f in frames]
-        except Exception as e:
-            print(f"\n[Error] Failed to load video {video_path}: {e}")
-            # 返回黑屏帧作为 Fallback，防止训练直接崩溃
-            dummy_frame = np.zeros((224, 224, 3), dtype=np.uint8)
-            return [Image.fromarray(dummy_frame) for _ in range(self.num_frames)]
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        # 🌟 修改点：从过滤后的干净列表里取数据
-        item = self.examples[idx] 
-        video_file = os.path.join(self.video_folder, item["video"])
+        item = self.examples[idx]
+        video_path = os.path.join(self.video_folder, item["video"])
         
-        pixel_values = self._load_video(video_file)
-        
-        # 统一使用全英文 Prompt，对齐之前的 Route B 数据集
+        # 构建符合 Qwen3-VL 的对话模板
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": pixel_values},
-                    {"type": "text", "text": "Please observe this short clip of cataract surgery and generate a detailed surgical report."}
+                    {"type": "video", "video": video_path}, # 直接传路径，库会自动处理
+                    {"type": "text", "text": "Observe this surgery clip and generate a report."},
                 ],
             },
             {
                 "role": "assistant",
-                "content": [
-                    {"type": "text", "text": item["conversations"][1]["value"]}
-                ],
+                "content": [{"type": "text", "text": item["conversations"][1]["value"]}],
             }
         ]
-
-        texts = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        
+        # 生成 prompt 和处理视觉特征
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        image_inputs, video_inputs = process_vision_info(messages)
+        
         inputs = self.processor(
-            text=[texts],
-            videos=[pixel_values],
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
             padding=True,
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
         )
-
+        
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}
+        inputs["labels"] = inputs["input_ids"].clone()
         return inputs
     
 def collate_fn(batch):
