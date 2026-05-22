@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+env/
+.env
+
+# 数据集与大文件 (核心拦截)
+videos/
+*.mp4
+*.avi
+*.jsonl
+
+# 三元组 数据 (核心拦截)
+triplets/
+*.json
+
+# 模型权重与输出结果 (核心拦截)
+output/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# IDE 配置文件
+.vscode/
+.idea/
